@@ -615,27 +615,34 @@ window.__SEED = /*SEED*/{"risk":{"file":"risk.xlsx","mtime":1795511380289.657,"u
     l.unshift([Date.now(), who, ok ? 1 : 0]); l = l.slice(0, 50); sset('elt.log', l);
   }
 
-  /* ---------- 지수 실시간 시세 (Yahoo Finance 차트 API, 브라우저에서 직접 조회) ---------- */
-  var LIVE = {}, liveAt = 0, liveBusy = false;
-  var SYM = { KOSPI200: '^KS200', 'S&P500': '^GSPC', NIKKEI225: '^N225', EUROSTOXX50: '^STOXX50E', HSCEI: '^HSCE' };
-  function getJson(url) {
-    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null, tm = setTimeout(function () { if (ctl) ctl.abort(); }, 7000);
-    return fetch(url, { cache: 'no-store', signal: ctl ? ctl.signal : undefined }).then(function (r) { clearTimeout(tm); if (!r.ok) throw new Error('http ' + r.status); return r.json(); });
+  /* ---------- 지수 시세: GitHub Actions 가 5분마다 갱신하는 quotes.json 을 읽음 ---------- */
+  var LIVE = {}, liveAt = 0, liveBusy = false, LIVE_STALE = 45 * 60 * 1000;
+  function quoteUrls() {
+    var u = [], m = location.hostname.match(/^([^.]+)\.github\.io$/), repo = location.pathname.split('/')[1];
+    if (m && repo) u.push('https://raw.githubusercontent.com/' + m[1] + '/' + repo + '/quotes/quotes.json');
+    else u.push('https://raw.githubusercontent.com/Cspace30/elt-risk-monitor/quotes/quotes.json');
+    u.push('./quotes.json');
+    return u;
   }
-  function fetchOne(k) {
-    var path = '/v8/finance/chart/' + encodeURIComponent(SYM[k]) + '?interval=1m&range=1d';
-    return getJson('https://query1.finance.yahoo.com' + path).catch(function () { return getJson('https://query2.finance.yahoo.com' + path); }).then(function (j) {
-      var m = j.chart.result[0].meta, per = m.currentTradingPeriod && m.currentTradingPeriod.regular, now = Date.now() / 1000;
-      var price = m.regularMarketPrice, prev = m.chartPreviousClose != null ? m.chartPreviousClose : m.previousClose;
-      if (!isFinite(price)) throw new Error('no price');
-      LIVE[k] = { price: price, prev: prev, t: (m.regularMarketTime || now) * 1000, open: !!(per && now >= per.start && now <= per.end + 60) };
-    });
+  function getJson(url) {
+    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null, tm = setTimeout(function () { if (ctl) ctl.abort(); }, 8000);
+    var sep = url.indexOf('?') < 0 ? '?' : '&';
+    return fetch(url + sep + 't=' + Math.floor(Date.now() / 60000), { cache: 'no-store', signal: ctl ? ctl.signal : undefined }).then(function (r) { clearTimeout(tm); if (!r.ok) throw new Error('http ' + r.status); return r.json(); });
   }
   function fetchLive(force) {
     if (liveBusy || typeof fetch === 'undefined') return Promise.resolve(false);
-    if (!force && Date.now() - liveAt < 15000) return Promise.resolve(false);
+    if (!force && Date.now() - liveAt < 60000) return Promise.resolve(false);
     liveBusy = true; liveAt = Date.now();
-    return Promise.all(Object.keys(SYM).map(function (k) { return fetchOne(k).then(function () { return 1; }, function () { return 0; }); })).then(function (r) { liveBusy = false; return r.indexOf(1) >= 0; }, function () { liveBusy = false; return false; });
+    var urls = quoteUrls();
+    var p = urls.reduce(function (chain, u) { return chain.catch(function () { return getJson(u); }); }, Promise.reject());
+    return p.then(function (j) {
+      var ok = false, now = Date.now(), fresh = j.updatedAt && now - j.updatedAt < LIVE_STALE;
+      Object.keys(j.quotes || {}).forEach(function (k) {
+        var q = j.quotes[k]; if (!q || !isFinite(q.price)) return;
+        LIVE[k] = { price: q.price, prev: q.prev, t: q.t, open: !!(fresh && q.start && now >= q.start && now <= q.end + 60000) }; ok = true;
+      });
+      liveBusy = false; return ok;
+    }, function () { liveBusy = false; return false; });
   }
   function spotOf(k) { return LIVE[k] ? LIVE[k].price : S.spot[k]; }
 
